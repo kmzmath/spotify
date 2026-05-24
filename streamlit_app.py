@@ -646,7 +646,7 @@ def main() -> None:
         filtro_curtidas = st.selectbox("Filtro de biblioteca", opcoes_filtro)
 
         st.divider()
-        if st.button("Limpar cache/reprocessar", use_container_width=True):
+        if st.button("Limpar cache/reprocessar", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -683,11 +683,11 @@ def main() -> None:
             with col_a:
                 st.write("Músicas")
                 top_musicas = gerar_ranking(df_filtrado, "faixa", 10)
-                st.dataframe(top_musicas, use_container_width=True, hide_index=True)
+                st.dataframe(top_musicas, width="stretch", hide_index=True)
             with col_b:
                 st.write("Artistas")
                 top_artistas = gerar_ranking(df_filtrado, "artista", 10)
-                st.dataframe(top_artistas, use_container_width=True, hide_index=True)
+                st.dataframe(top_artistas, width="stretch", hide_index=True)
 
     with aba_rankings:
         st.subheader("Rankings")
@@ -699,7 +699,7 @@ def main() -> None:
         else:
             nome_item = {"faixa": "música", "artista": "artista", "album_chave": "álbum"}[coluna]
             ranking_view = ranking.rename(columns={coluna: nome_item})
-            st.dataframe(ranking_view, use_container_width=True, hide_index=True)
+            st.dataframe(ranking_view, width="stretch", hide_index=True)
             csv_download(ranking_view, f"ranking_{tipo_ranking.lower()}.csv", "Baixar ranking CSV")
 
     with aba_graficos:
@@ -739,7 +739,7 @@ def main() -> None:
                     st.warning("Sem dados mensais para esse item.")
                 else:
                     st.line_chart(mensal)
-                    st.dataframe(mensal.reset_index(), use_container_width=True, hide_index=True)
+                    st.dataframe(mensal.reset_index(), width="stretch", hide_index=True)
                     csv_download(mensal.reset_index(), "ouvidas_mensais.csv", "Baixar mensal CSV")
 
     with aba_especiais:
@@ -780,7 +780,7 @@ def main() -> None:
         if resultado.empty:
             st.warning("Sem dados suficientes para essa análise.")
         else:
-            st.dataframe(resultado, use_container_width=True, hide_index=True)
+            st.dataframe(resultado, width="stretch", hide_index=True)
             csv_download(resultado, f"{opcao.lower().replace(' ', '_')}.csv", "Baixar resultado CSV")
 
     with aba_arquivos:
@@ -801,7 +801,7 @@ def main() -> None:
                 for item in history_uploads
             ]
         )
-        st.dataframe(historicos_df, use_container_width=True, hide_index=True)
+        st.dataframe(historicos_df, width="stretch", hide_index=True)
 
         st.markdown("#### Biblioteca")
         if library_upload is None:
@@ -817,23 +817,23 @@ def main() -> None:
                         }
                     ]
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
         st.markdown("#### Diagnóstico dos dados carregados")
         diag = pd.DataFrame(
             [
-                {"métrica": "Registros musicais carregados", "valor": len(df)},
-                {"métrica": "Primeira data no histórico", "valor": data_min},
-                {"métrica": "Última data no histórico", "valor": data_max},
-                {"métrica": "Registros no período filtrado", "valor": len(df_filtrado)},
+                {"métrica": "Registros musicais carregados", "valor": formatar_numero(len(df))},
+                {"métrica": "Primeira data no histórico", "valor": data_min.isoformat()},
+                {"métrica": "Última data no histórico", "valor": data_max.isoformat()},
+                {"métrica": "Registros no período filtrado", "valor": formatar_numero(len(df_filtrado))},
                 {"métrica": "Campo de tempo usado", "valor": "ms_played com fallback para msPlayed"},
                 {"métrica": "Regra de skip curto", "valor": "skipped=True e ms_played < 35000"},
                 {"métrica": "Persistência no servidor", "valor": "Não grava arquivos em disco; processa uploads em memória/sessão."},
             ]
         )
-        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.dataframe(diag, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
