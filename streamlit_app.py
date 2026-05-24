@@ -15,6 +15,7 @@ Rodar localmente:
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -82,6 +83,66 @@ def _parse_data(ts: str) -> date | None:
         except Exception:
             return None
 
+
+
+def _limpar_nome_artista(nome: str) -> str:
+    """Normaliza espaços e remove sujeira comum em nomes extraídos de títulos."""
+    nome = str(nome or "").strip()
+    nome = re.sub(r"\s+", " ", nome)
+    nome = nome.strip(" -–—,;:/()[]{}")
+    return nome
+
+
+def _separar_artistas_featured(texto: str) -> list[str]:
+    """
+    Divide somente textos de participação, como "A, B & C".
+    Não divide o artista principal por '&' para não quebrar duplas/bandas
+    como "Munhoz & Mariano" ou "Simon & Garfunkel".
+    """
+    if not texto:
+        return []
+
+    partes = re.split(
+        r"\s*(?:,|;|/|\s+&\s+|\s+and\s+|\s+x\s+|\s+X\s+)\s*",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    return [p for p in (_limpar_nome_artista(parte) for parte in partes) if p]
+
+
+def extrair_artistas_creditados(artista_principal: str, musica: str) -> list[str]:
+    """
+    Retorna artista principal + artistas citados no título como feat./ft./featuring/with.
+
+    Limite importante: o JSON de histórico estendido do Spotify geralmente traz apenas
+    `master_metadata_album_artist_name`, não uma lista oficial de todos os artistas da faixa.
+    Portanto, os artistas extras são inferidos pelo título quando há padrões do tipo
+    "(feat. Nome)", "(ft. Nome)" ou "(with Nome)".
+    """
+    artistas: list[str] = []
+    principal = _limpar_nome_artista(artista_principal)
+    if principal:
+        artistas.append(principal)
+
+    titulo = str(musica or "")
+    padroes = [
+        r"\((?:feat\.?|ft\.?|featuring|with)\s+([^\)]+)\)",
+        r"\[(?:feat\.?|ft\.?|featuring|with)\s+([^\]]+)\]",
+        r"\s+-\s+(?:feat\.?|ft\.?|featuring|with)\s+(.+)$",
+    ]
+    for padrao in padroes:
+        for encontrado in re.findall(padrao, titulo, flags=re.IGNORECASE):
+            artistas.extend(_separar_artistas_featured(encontrado))
+
+    # Remove duplicatas preservando ordem e ignorando diferenças de maiúsculas/minúsculas.
+    vistos: set[str] = set()
+    resultado: list[str] = []
+    for artista in artistas:
+        chave = artista.casefold()
+        if chave and chave not in vistos:
+            vistos.add(chave)
+            resultado.append(artista)
+    return resultado
 
 def ler_json_upload(uploaded_file, origem: str) -> JsonUpload:
     raw = uploaded_file.getvalue()
@@ -244,6 +305,8 @@ def carregar_historico_dos_jsons(upload_key: tuple[tuple[str, str], ...]) -> pd.
                 ms_played = 0
 
             skipped = bool(registro.get("skipped", False))
+            artistas_creditados = extrair_artistas_creditados(artista, musica)
+            artistas_creditados_texto = " | ".join(artistas_creditados)
             faixa = f"{artista} | {musica}"
             album_chave = f"{artista} | {album}"
 
@@ -254,6 +317,7 @@ def carregar_historico_dos_jsons(upload_key: tuple[tuple[str, str], ...]) -> pd.
                     "plataforma": registro.get("platform", ""),
                     "pais": registro.get("conn_country", ""),
                     "artista": artista,
+                    "artistas_creditados_texto": artistas_creditados_texto,
                     "musica": musica,
                     "album": album,
                     "faixa": faixa,
@@ -273,6 +337,7 @@ def carregar_historico_dos_jsons(upload_key: tuple[tuple[str, str], ...]) -> pd.
         "plataforma",
         "pais",
         "artista",
+        "artistas_creditados_texto",
         "musica",
         "album",
         "faixa",
@@ -332,10 +397,39 @@ def aplicar_filtros(
 def nome_coluna_entidade(tipo: str) -> str:
     mapa = {
         "Músicas": "faixa",
-        "Artistas": "artista",
+        "Artistas": "artista_creditado",
         "Álbuns": "album_chave",
     }
     return mapa[tipo]
+
+
+def expandir_artistas_para_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    """Duplica linhas para ranking por artista creditado."""
+    if df.empty:
+        return df.copy()
+
+    linhas: list[dict] = []
+    for _, linha in df.iterrows():
+        artistas = extrair_artistas_creditados(linha.get("artista", ""), linha.get("musica", ""))
+        if not artistas:
+            continue
+        for artista_creditado in artistas:
+            nova = linha.to_dict()
+            nova["artista_creditado"] = artista_creditado
+            linhas.append(nova)
+
+    if not linhas:
+        resultado = df.copy()
+        resultado["artista_creditado"] = resultado.get("artista", "")
+        return resultado
+
+    return pd.DataFrame(linhas)
+
+
+def preparar_df_entidade(df: pd.DataFrame, coluna: str) -> pd.DataFrame:
+    if coluna == "artista_creditado":
+        return expandir_artistas_para_ranking(df)
+    return df
 
 
 def gerar_ranking(df: pd.DataFrame, coluna: str, top_n: int, minimo_streams: int = 1) -> pd.DataFrame:
@@ -363,6 +457,68 @@ def gerar_ranking(df: pd.DataFrame, coluna: str, top_n: int, minimo_streams: int
     ranking = ranking.sort_values(["streams", "horas"], ascending=[False, False]).head(top_n)
     ranking.insert(0, "posição", range(1, len(ranking) + 1))
     return ranking
+
+
+
+def gerar_ranking_completo(df: pd.DataFrame, coluna: str, minimo_streams: int = 1) -> pd.DataFrame:
+    """Ranking sem corte de Top N. Usado para busca/auditoria."""
+    if df.empty or coluna not in df.columns:
+        return pd.DataFrame()
+
+    ranking = (
+        df.groupby(coluna, dropna=True)
+        .agg(
+            streams=(coluna, "size"),
+            horas=("ms_played", lambda s: round(s.sum() / 3_600_000, 2)),
+            skips=("skip_curto", "sum"),
+            primeira_vez=("data", "min"),
+            ultima_vez=("data", "max"),
+        )
+        .reset_index()
+    )
+    ranking = ranking[ranking["streams"] >= minimo_streams]
+    if ranking.empty:
+        return ranking
+
+    ranking["skip_%"] = (ranking["skips"] / ranking["streams"] * 100).round(2)
+    ranking = ranking.sort_values(["streams", "horas"], ascending=[False, False]).reset_index(drop=True)
+    ranking.insert(0, "posição", range(1, len(ranking) + 1))
+    ranking["primeira_vez"] = ranking["primeira_vez"].dt.date
+    ranking["ultima_vez"] = ranking["ultima_vez"].dt.date
+    return ranking
+
+
+def buscar_historico(df: pd.DataFrame, termo: str) -> pd.DataFrame:
+    """Busca livre em artista, música, álbum e faixa."""
+    termo = termo.strip()
+    if df.empty or not termo:
+        return pd.DataFrame()
+
+    colunas_busca = ["artista", "artistas_creditados_texto", "musica", "album", "faixa", "album_chave"]
+    mascara = pd.Series(False, index=df.index)
+    for coluna in colunas_busca:
+        if coluna in df.columns:
+            mascara = mascara | df[coluna].astype(str).str.contains(termo, case=False, na=False, regex=False)
+
+    resultado = df.loc[mascara, [
+        "data",
+        "timestamp",
+        "artista",
+        "artistas_creditados_texto",
+        "musica",
+        "album",
+        "ms_played",
+        "skipped_spotify",
+        "skip_curto",
+        "arquivo_origem",
+    ]].copy()
+    if resultado.empty:
+        return resultado
+
+    resultado["data"] = resultado["data"].dt.date
+    resultado["segundos"] = (resultado["ms_played"] / 1000).round(1)
+    return resultado.sort_values(["data", "timestamp"], ascending=[False, False])
+
 
 
 def gerar_cumulativo(df: pd.DataFrame, coluna: str, top_n: int, data_inicio: date, data_final: date) -> pd.DataFrame:
@@ -637,7 +793,7 @@ def main() -> None:
         else:
             data_inicio, data_final = data_min, data_max
 
-        top_n = st.slider("Top N", min_value=5, max_value=200, value=20, step=5)
+        top_n = st.slider("Top N", min_value=5, max_value=1000, value=100, step=5)
         minimo_streams = st.slider("Mínimo de streams para rankings de skip", 1, 50, 5)
 
         opcoes_filtro = ["Todas"]
@@ -670,7 +826,8 @@ def main() -> None:
             col1.metric("Streams", formatar_numero(len(df_filtrado)))
             col2.metric("Horas ouvidas", formatar_numero(df_filtrado["ms_played"].sum() / 3_600_000, 1))
             col3.metric("Músicas únicas", formatar_numero(df_filtrado["faixa"].nunique()))
-            col4.metric("Artistas únicos", formatar_numero(df_filtrado["artista"].nunique()))
+            df_artistas_filtrado = expandir_artistas_para_ranking(df_filtrado)
+            col4.metric("Artistas únicos", formatar_numero(df_artistas_filtrado["artista_creditado"].nunique()))
             skip_pct = df_filtrado["skip_curto"].mean() * 100 if len(df_filtrado) else 0
             col5.metric("Skips curtos", f"{skip_pct:.2f}%".replace(".", ","))
 
@@ -686,27 +843,53 @@ def main() -> None:
                 st.dataframe(top_musicas, width="stretch", hide_index=True)
             with col_b:
                 st.write("Artistas")
-                top_artistas = gerar_ranking(df_filtrado, "artista", 10)
+                top_artistas = gerar_ranking(expandir_artistas_para_ranking(df_filtrado), "artista_creditado", 10)
+                top_artistas = top_artistas.rename(columns={"artista_creditado": "artista"})
                 st.dataframe(top_artistas, width="stretch", hide_index=True)
 
     with aba_rankings:
         st.subheader("Rankings")
         tipo_ranking = st.radio("Tipo", ["Músicas", "Artistas", "Álbuns"], horizontal=True)
         coluna = nome_coluna_entidade(tipo_ranking)
-        ranking = gerar_ranking(df_filtrado, coluna, top_n)
+        df_entidade = preparar_df_entidade(df_filtrado, coluna)
+        ranking = gerar_ranking(df_entidade, coluna, top_n)
         if ranking.empty:
             st.warning("Sem dados para esse ranking.")
         else:
-            nome_item = {"faixa": "música", "artista": "artista", "album_chave": "álbum"}[coluna]
+            nome_item = {"faixa": "música", "artista_creditado": "artista", "album_chave": "álbum"}[coluna]
             ranking_view = ranking.rename(columns={coluna: nome_item})
             st.dataframe(ranking_view, width="stretch", hide_index=True)
             csv_download(ranking_view, f"ranking_{tipo_ranking.lower()}.csv", "Baixar ranking CSV")
+
+            st.markdown("#### Procurar item fora do Top N")
+            termo_ranking = st.text_input(
+                f"Buscar em {tipo_ranking.lower()}",
+                key=f"busca_ranking_{tipo_ranking}",
+                placeholder="Ex.: Marina Sena, Por Supuesto, Coisas Naturais",
+            )
+            if termo_ranking.strip():
+                ranking_completo = gerar_ranking_completo(df_entidade, coluna)
+                busca_ranking = ranking_completo[
+                    ranking_completo[coluna].astype(str).str.contains(
+                        termo_ranking.strip(),
+                        case=False,
+                        na=False,
+                        regex=False,
+                    )
+                ].copy()
+
+                if busca_ranking.empty:
+                    st.warning("Esse termo não aparece nos dados filtrados. Verifique período e filtro de biblioteca.")
+                else:
+                    busca_ranking = busca_ranking.rename(columns={coluna: nome_item})
+                    st.dataframe(busca_ranking, width="stretch", hide_index=True)
 
     with aba_graficos:
         st.subheader("Gráfico cumulativo")
         tipo_grafico = st.radio("Entidade", ["Músicas", "Artistas", "Álbuns"], horizontal=True, key="tipo_grafico")
         coluna_grafico = nome_coluna_entidade(tipo_grafico)
-        cumulativo = gerar_cumulativo(df_filtrado, coluna_grafico, top_n, data_inicio, data_final)
+        df_grafico = preparar_df_entidade(df_filtrado, coluna_grafico)
+        cumulativo = gerar_cumulativo(df_grafico, coluna_grafico, top_n, data_inicio, data_final)
         if cumulativo.empty:
             st.warning("Sem dados para plotar.")
         else:
@@ -719,7 +902,8 @@ def main() -> None:
         tipo_mensal = st.radio("Tipo", ["Músicas", "Artistas", "Álbuns"], horizontal=True, key="tipo_mensal")
         coluna_mensal = nome_coluna_entidade(tipo_mensal)
 
-        ranking_base = gerar_ranking(df_filtrado, coluna_mensal, top_n=500)
+        df_mensal = preparar_df_entidade(df_filtrado, coluna_mensal)
+        ranking_base = gerar_ranking(df_mensal, coluna_mensal, top_n=500)
         if ranking_base.empty:
             st.warning("Sem dados para seleção mensal.")
         else:
@@ -734,7 +918,7 @@ def main() -> None:
                 st.warning("Nenhum item encontrado com esse filtro.")
             else:
                 item = st.selectbox("Item", opcoes_filtradas)
-                mensal = gerar_mensal(df_filtrado, coluna_mensal, item)
+                mensal = gerar_mensal(df_mensal, coluna_mensal, item)
                 if mensal.empty:
                     st.warning("Sem dados mensais para esse item.")
                 else:
@@ -828,12 +1012,34 @@ def main() -> None:
                 {"métrica": "Primeira data no histórico", "valor": data_min.isoformat()},
                 {"métrica": "Última data no histórico", "valor": data_max.isoformat()},
                 {"métrica": "Registros no período filtrado", "valor": formatar_numero(len(df_filtrado))},
+                {"métrica": "Filtro de biblioteca ativo", "valor": filtro_curtidas},
                 {"métrica": "Campo de tempo usado", "valor": "ms_played com fallback para msPlayed"},
                 {"métrica": "Regra de skip curto", "valor": "skipped=True e ms_played < 35000"},
                 {"métrica": "Persistência no servidor", "valor": "Não grava arquivos em disco; processa uploads em memória/sessão."},
             ]
         )
         st.dataframe(diag, width="stretch", hide_index=True)
+
+        st.markdown("#### Busca bruta no histórico")
+        termo_auditoria = st.text_input(
+            "Buscar artista, música ou álbum nos registros carregados",
+            placeholder="Ex.: Marina Sena",
+            key="busca_bruta_historico",
+        )
+        if termo_auditoria.strip():
+            bruto = buscar_historico(df, termo_auditoria)
+            bruto_filtrado = buscar_historico(df_filtrado, termo_auditoria)
+
+            st.caption(f"Ocorrências no histórico completo carregado: {len(bruto)}")
+            st.caption(f"Ocorrências após filtros atuais: {len(bruto_filtrado)}")
+
+            if bruto_filtrado.empty and not bruto.empty:
+                st.warning("O termo existe no histórico, mas sumiu com os filtros atuais. Confira período e filtro de biblioteca.")
+                st.dataframe(bruto.head(500), width="stretch", hide_index=True)
+            elif bruto_filtrado.empty:
+                st.warning("Nenhuma ocorrência encontrada no histórico carregado.")
+            else:
+                st.dataframe(bruto_filtrado.head(500), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
